@@ -51,11 +51,8 @@ type ConnectionProfile = {
 	port: number;
 	username: string;
 	authMethod: string;
-	privateKeyPath: string;
-};
-
-type ConnectionSecret = {
 	password: string;
+	privateKeyPath: string;
 	privateKeyPassphrase: string;
 };
 
@@ -63,7 +60,6 @@ const backendReady = Boolean((window as any).go?.main?.App && (window as any).ru
 const sessions = new Map<string, ShellSession>();
 const profiles: ConnectionProfile[] = [];
 const profileSessionIds = new Map<string, string>();
-const profileSecrets = new Map<string, ConnectionSecret>();
 const transparencyStorageKey = 'simpleshell.backgroundTransparency';
 const profilesStorageKey = 'simpleshell.connectionProfiles';
 const defaultTransparency = 100;
@@ -376,7 +372,9 @@ function loadProfiles() {
 				port: Number(profile.port || 22),
 				username: String(profile.username),
 				authMethod: profile.authMethod === 'key' ? 'key' : 'password',
+				password: String(profile.password || ''),
 				privateKeyPath: String(profile.privateKeyPath || ''),
+				privateKeyPassphrase: String(profile.privateKeyPassphrase || ''),
 			})));
 	} catch {
 		profiles.splice(0, profiles.length);
@@ -389,7 +387,6 @@ function saveProfiles() {
 
 function openConnectionModal(profileId = '') {
 	const profile = profiles.find((item) => item.id === profileId);
-	const secret = profile ? profileSecrets.get(profile.id) : undefined;
 
 	editingProfileId = profile?.id || '';
 	connectionModalTitle.textContent = profile ? '编辑连接' : '新建连接';
@@ -398,9 +395,9 @@ function openConnectionModal(profileId = '') {
 	portInput.value = String(profile?.port || 22);
 	usernameInput.value = profile?.username || '';
 	authMethodInput.value = profile?.authMethod || 'password';
-	passwordInput.value = secret?.password || '';
+	passwordInput.value = profile?.password || '';
 	privateKeyPathInput.value = profile?.privateKeyPath || '';
-	privateKeyPassphraseInput.value = secret?.privateKeyPassphrase || '';
+	privateKeyPassphraseInput.value = profile?.privateKeyPassphrase || '';
 	connectButton.textContent = '保存并连接';
 	messageBar.textContent = '';
 	syncAuthFields();
@@ -427,7 +424,9 @@ function readProfileFromForm(): ConnectionProfile {
 		port,
 		username,
 		authMethod: authMethodInput.value === 'key' ? 'key' : 'password',
+		password: passwordInput.value,
 		privateKeyPath: privateKeyPathInput.value.trim(),
+		privateKeyPassphrase: privateKeyPassphraseInput.value,
 	};
 }
 
@@ -440,13 +439,6 @@ function upsertProfile(profile: ConnectionProfile) {
 	}
 	saveProfiles();
 	renderConnections();
-}
-
-function rememberProfileSecret(profileId: string) {
-	profileSecrets.set(profileId, {
-		password: passwordInput.value,
-		privateKeyPassphrase: privateKeyPassphraseInput.value,
-	});
 }
 
 function profileLabel(profile: ConnectionProfile) {
@@ -466,7 +458,6 @@ async function connect() {
 	const profile = readProfileFromForm();
 
 	upsertProfile(profile);
-	rememberProfileSecret(profile.id);
 	closeConnectionModal();
 	await connectProfile(profile.id, true);
 }
@@ -495,8 +486,7 @@ async function connectProfile(profileId: string, forceReconnect = false) {
 		}
 	}
 
-	const secret = profileSecrets.get(profile.id) || {password: '', privateKeyPassphrase: ''};
-	if (profile.authMethod === 'password' && !secret.password) {
+	if (profile.authMethod === 'password' && !profile.password) {
 		openConnectionModal(profile.id);
 		showError('请输入密码后再连接。');
 		return;
@@ -521,9 +511,9 @@ async function connectProfile(profileId: string, forceReconnect = false) {
 		port: Number(profile.port || '22'),
 		username: profile.username,
 		authMethod: profile.authMethod,
-		password: secret.password,
+		password: profile.password,
 		privateKeyPath: profile.privateKeyPath,
-		privateKeyPassphrase: secret.privateKeyPassphrase,
+		privateKeyPassphrase: profile.privateKeyPassphrase,
 	};
 
 	try {
@@ -756,7 +746,6 @@ async function deleteProfile(profileId: string) {
 	}
 
 	profileSessionIds.delete(profileId);
-	profileSecrets.delete(profileId);
 	const index = profiles.findIndex((item) => item.id === profileId);
 	if (index >= 0) {
 		profiles.splice(index, 1);
