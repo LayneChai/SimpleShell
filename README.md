@@ -112,3 +112,5 @@ npm run build
 ## 目标平台
 
 当前主要面向 Windows x64。
+
+![LINUX DO - 新的理想型社区](https://linux.do/)
