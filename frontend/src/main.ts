@@ -56,6 +56,12 @@ type ConnectionProfile = {
 	privateKeyPassphrase: string;
 };
 
+type CommandSuggestion = {
+	command: string;
+	description: string;
+	category: string;
+};
+
 const backendReady = Boolean((window as any).go?.main?.App && (window as any).runtime);
 const sessions = new Map<string, ShellSession>();
 const profiles: ConnectionProfile[] = [];
@@ -63,8 +69,32 @@ const profileSessionIds = new Map<string, string>();
 const transparencyStorageKey = 'simpleshell.backgroundTransparency';
 const profilesStorageKey = 'simpleshell.connectionProfiles';
 const defaultTransparency = 100;
+const commandSuggestionLimit = 6;
+const commandSuggestions: CommandSuggestion[] = [
+	{command: 'pwd', description: '显示当前所在目录', category: '目录'},
+	{command: 'ls -la', description: '查看当前目录下的全部文件', category: '目录'},
+	{command: 'cd /path/to/dir', description: '进入指定目录', category: '目录'},
+	{command: 'mkdir new-folder', description: '创建新目录', category: '文件'},
+	{command: 'touch file.txt', description: '创建空文件或更新时间', category: '文件'},
+	{command: 'cat file.txt', description: '查看文件内容', category: '文件'},
+	{command: 'tail -f app.log', description: '实时查看日志输出', category: '日志'},
+	{command: 'grep -n "keyword" file.txt', description: '在文件中搜索关键词', category: '搜索'},
+	{command: 'find . -name "*.log"', description: '按名称查找文件', category: '搜索'},
+	{command: 'df -h', description: '查看磁盘空间', category: '系统'},
+	{command: 'free -h', description: '查看内存使用情况', category: '系统'},
+	{command: 'top', description: '查看正在运行的进程', category: '系统'},
+	{command: 'ps aux | grep name', description: '查找指定进程', category: '进程'},
+	{command: 'systemctl status service', description: '查看服务状态', category: '服务'},
+	{command: 'systemctl restart service', description: '重启指定服务', category: '服务'},
+	{command: 'ip addr', description: '查看服务器网络地址', category: '网络'},
+	{command: 'ping example.com', description: '测试网络连通性', category: '网络'},
+	{command: 'curl -I https://example.com', description: '查看 HTTP 响应头', category: '网络'},
+	{command: 'scp file user@host:/path', description: '复制文件到远程服务器', category: '传输'},
+	{command: 'chmod +x script.sh', description: '给脚本添加执行权限', category: '权限'},
+];
 let activeSessionId = '';
 let editingProfileId = '';
+let activeSuggestionIndex = 0;
 
 document.querySelector('#app')!.innerHTML = `
 	<div class="app-shell">
@@ -119,9 +149,10 @@ document.querySelector('#app')!.innerHTML = `
 				<div id="terminalStack" class="terminal-stack"></div>
 			</div>
 			<form id="commandForm" class="command-bar">
-				<input id="commandInput" type="text" autocomplete="off" placeholder="输入命令后按回车执行" disabled />
+				<input id="commandInput" type="text" autocomplete="off" placeholder="输入命令后按回车执行" aria-autocomplete="list" aria-controls="commandSuggestions" disabled />
 				<button id="sendCommandButton" type="submit" class="primary-button" disabled>运行</button>
 			</form>
+			<div id="commandSuggestions" class="command-suggestions hidden" role="listbox" aria-label="命令提示"></div>
 			<div id="messageBar" class="message-bar" role="status" aria-live="polite"></div>
 		</section>
 		</main>
@@ -224,6 +255,7 @@ const clearTerminalButton = document.getElementById('clearTerminalButton') as HT
 const commandForm = document.getElementById('commandForm') as HTMLFormElement;
 const commandInput = document.getElementById('commandInput') as HTMLInputElement;
 const sendCommandButton = document.getElementById('sendCommandButton') as HTMLButtonElement;
+const commandSuggestionsElement = document.getElementById('commandSuggestions') as HTMLElement;
 const messageBar = document.getElementById('messageBar') as HTMLElement;
 
 loadTransparency();
@@ -294,8 +326,45 @@ function bindEvents() {
 		event.preventDefault();
 		void sendCommandLine();
 	});
+	commandInput.addEventListener('input', () => {
+		activeSuggestionIndex = 0;
+		renderCommandSuggestions();
+	});
+	commandInput.addEventListener('focus', renderCommandSuggestions);
+	commandInput.addEventListener('blur', () => {
+		window.setTimeout(hideCommandSuggestions, 120);
+	});
 	commandInput.addEventListener('keydown', (event) => {
+		const suggestions = matchingCommandSuggestions();
+		const hasVisibleSuggestions = commandSuggestionsElement.dataset.visible === 'true' && suggestions.length > 0;
+
+		if (hasVisibleSuggestions && event.key === 'ArrowDown') {
+			event.preventDefault();
+			activeSuggestionIndex = (activeSuggestionIndex + 1) % suggestions.length;
+			renderCommandSuggestions();
+			return;
+		}
+		if (hasVisibleSuggestions && event.key === 'ArrowUp') {
+			event.preventDefault();
+			activeSuggestionIndex = (activeSuggestionIndex - 1 + suggestions.length) % suggestions.length;
+			renderCommandSuggestions();
+			return;
+		}
+		if (hasVisibleSuggestions && event.key === 'Tab') {
+			event.preventDefault();
+			applyCommandSuggestion(suggestions[activeSuggestionIndex]);
+			return;
+		}
+		if (event.key === 'Escape') {
+			hideCommandSuggestions();
+			return;
+		}
 		if (event.key !== 'Enter') {
+			return;
+		}
+		if (hasVisibleSuggestions) {
+			event.preventDefault();
+			applyCommandSuggestion(suggestions[activeSuggestionIndex]);
 			return;
 		}
 		event.preventDefault();
@@ -541,12 +610,103 @@ async function sendCommandLine() {
 		return;
 	}
 	commandInput.value = '';
+	hideCommandSuggestions();
 
 	if (backendReady && shell.status === 'Connected') {
 		await SendInput(shell.id, `${command}\r`).catch((error) => showError(error, shell.id));
 	} else {
 		shell.terminal.write(`\r\n$ ${command}\r\n`);
 	}
+}
+
+function matchingCommandSuggestions() {
+	if (commandInput.disabled) {
+		return [];
+	}
+
+	const query = commandInput.value.trim().toLowerCase();
+	if (!query) {
+		return commandSuggestions.slice(0, commandSuggestionLimit);
+	}
+
+	return commandSuggestions
+		.filter((suggestion) => {
+			const searchable = `${suggestion.command} ${suggestion.description} ${suggestion.category}`.toLowerCase();
+			return searchable.includes(query);
+		})
+		.slice(0, commandSuggestionLimit);
+}
+
+function renderCommandSuggestions() {
+	const suggestions = matchingCommandSuggestions();
+	if (suggestions.length === 0 || document.activeElement !== commandInput) {
+		hideCommandSuggestions();
+		return;
+	}
+
+	activeSuggestionIndex = Math.min(activeSuggestionIndex, suggestions.length - 1);
+	commandSuggestionsElement.dataset.visible = 'true';
+	commandSuggestionsElement.classList.remove('hidden');
+	commandSuggestionsElement.innerHTML = suggestions.map((suggestion, index) => `
+		<button
+			type="button"
+			class="command-suggestion ${index === activeSuggestionIndex ? 'active' : ''}"
+			data-index="${index}"
+			role="option"
+			aria-selected="${index === activeSuggestionIndex}"
+		>
+			<span class="command-suggestion-main">${highlightCommandMatch(suggestion.command)}</span>
+			<span class="command-suggestion-meta">
+				<strong>${escapeHtml(suggestion.category)}</strong>
+				${escapeHtml(suggestion.description)}
+			</span>
+		</button>
+	`).join('');
+
+	commandSuggestionsElement.querySelectorAll<HTMLButtonElement>('.command-suggestion').forEach((button) => {
+		button.addEventListener('mouseenter', () => {
+			activeSuggestionIndex = Number(button.dataset.index || '0');
+			renderCommandSuggestions();
+		});
+		button.addEventListener('mousedown', (event) => {
+			event.preventDefault();
+			applyCommandSuggestion(suggestions[Number(button.dataset.index || '0')]);
+		});
+	});
+}
+
+function hideCommandSuggestions() {
+	commandSuggestionsElement.dataset.visible = 'false';
+	commandSuggestionsElement.classList.add('hidden');
+	commandSuggestionsElement.innerHTML = '';
+}
+
+function applyCommandSuggestion(suggestion: CommandSuggestion | undefined) {
+	if (!suggestion) {
+		return;
+	}
+
+	commandInput.value = suggestion.command;
+	hideCommandSuggestions();
+	commandInput.focus();
+	commandInput.setSelectionRange(commandInput.value.length, commandInput.value.length);
+}
+
+function highlightCommandMatch(command: string) {
+	const query = commandInput.value.trim();
+	if (!query) {
+		return escapeHtml(command);
+	}
+
+	const index = command.toLowerCase().indexOf(query.toLowerCase());
+	if (index < 0) {
+		return escapeHtml(command);
+	}
+
+	const before = command.slice(0, index);
+	const match = command.slice(index, index + query.length);
+	const after = command.slice(index + query.length);
+	return `${escapeHtml(before)}<mark>${escapeHtml(match)}</mark>${escapeHtml(after)}`;
 }
 
 async function confirmHostKey(prompt: HostKeyPrompt) {
@@ -769,6 +929,9 @@ function updateActiveChrome() {
 	clearTerminalButton.disabled = !hasActive;
 	commandInput.disabled = !hasActive;
 	sendCommandButton.disabled = !hasActive;
+	if (!hasActive) {
+		hideCommandSuggestions();
+	}
 	if (shell) {
 		statusText.textContent = `${shortLabel(shell.label)} · ${localizedStatus(shell.status)}`;
 		statusText.title = `${shell.label} · ${localizedStatus(shell.status)}`;
