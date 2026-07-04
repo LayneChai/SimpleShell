@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -49,6 +52,20 @@ type ConnectionStatus struct {
 type TerminalOutput struct {
 	SessionID string `json:"sessionId"`
 	Data      string `json:"data"`
+}
+
+type AICommandRequest struct {
+	Provider string `json:"provider"`
+	APIKey   string `json:"apiKey"`
+	Endpoint string `json:"endpoint"`
+	Model    string `json:"model"`
+	Prompt   string `json:"prompt"`
+}
+
+type AICommandSuggestion struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+	Category    string `json:"category"`
 }
 
 type HostKeyPrompt struct {
@@ -323,6 +340,41 @@ func (a *App) SelectPrivateKey() (string, error) {
 	})
 }
 
+func (a *App) GenerateAICommands(request AICommandRequest) ([]AICommandSuggestion, error) {
+	request.Provider = strings.TrimSpace(request.Provider)
+	request.APIKey = strings.TrimSpace(request.APIKey)
+	request.Endpoint = strings.TrimSpace(request.Endpoint)
+	request.Model = strings.TrimSpace(request.Model)
+	request.Prompt = strings.TrimSpace(request.Prompt)
+
+	if request.APIKey == "" {
+		return nil, errors.New("AI API Key is required")
+	}
+	if request.Prompt == "" {
+		return nil, errors.New("AI prompt is required")
+	}
+	request = normalizeAICommandRequest(request)
+
+	var text string
+	var err error
+	if request.Provider == "gemini" {
+		text, err = callGeminiCommands(request)
+	} else {
+		text, err = callChatCompletionCommands(request)
+	}
+	if err != nil {
+		return nil, err
+	}
+	suggestions, err := parseAICommandSuggestions(text)
+	if err != nil {
+		return nil, err
+	}
+	if len(suggestions) == 0 {
+		return nil, errors.New("AI returned no command suggestions")
+	}
+	return suggestions, nil
+}
+
 func (a *App) ConfirmHostKey(id string, accept bool) error {
 	a.pendingMu.Lock()
 	ch, ok := a.pendingHostKeys[id]
@@ -503,6 +555,248 @@ func validateConnectionOptions(options ConnectionOptions) error {
 		return errors.New("认证方式必须是密码或私钥")
 	}
 	return nil
+}
+
+func extractAIResponseText(data []byte) (string, error) {
+	var raw struct {
+		OutputText string `json:"output_text"`
+		Output     []struct {
+			Content []struct {
+				Text string `json:"text"`
+				Type string `json:"type"`
+			} `json:"content"`
+		} `json:"output"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return "", fmt.Errorf("could not parse AI response: %w", err)
+	}
+	if raw.Error != nil && raw.Error.Message != "" {
+		return "", errors.New(raw.Error.Message)
+	}
+	if strings.TrimSpace(raw.OutputText) != "" {
+		return raw.OutputText, nil
+	}
+	var builder strings.Builder
+	for _, output := range raw.Output {
+		for _, content := range output.Content {
+			if content.Text != "" {
+				builder.WriteString(content.Text)
+			}
+		}
+	}
+	text := strings.TrimSpace(builder.String())
+	if text == "" {
+		return "", errors.New("AI response did not contain text")
+	}
+	return text, nil
+}
+
+func normalizeAICommandRequest(request AICommandRequest) AICommandRequest {
+	if request.Provider == "" {
+		request.Provider = "chatgpt"
+	}
+	if request.Provider != "custom" || request.Endpoint == "" || request.Model == "" {
+		endpoint, model := defaultAIProviderConfig(request.Provider)
+		if request.Endpoint == "" {
+			request.Endpoint = endpoint
+		}
+		if request.Model == "" {
+			request.Model = model
+		}
+	}
+	return request
+}
+
+func defaultAIProviderConfig(provider string) (string, string) {
+	switch provider {
+	case "deepseek":
+		return "https://api.deepseek.com/chat/completions", "deepseek-chat"
+	case "kimi":
+		return "https://api.moonshot.cn/v1/chat/completions", "moonshot-v1-8k"
+	case "glm":
+		return "https://open.bigmodel.cn/api/paas/v4/chat/completions", "glm-4-flash"
+	case "gemini":
+		return "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent", "gemini-2.0-flash"
+	case "custom":
+		return "", ""
+	default:
+		return "https://api.openai.com/v1/chat/completions", "gpt-4.1-mini"
+	}
+}
+
+func aiCommandSystemPrompt() string {
+	return "You are an SSH command assistant. Return only a JSON array with 1 to 5 items. Each item must contain command, description, and category strings. Suggest commands only; do not include markdown. Prefer safe read-only commands before mutating commands."
+}
+
+func callChatCompletionCommands(request AICommandRequest) (string, error) {
+	payload := map[string]interface{}{
+		"model": request.Model,
+		"messages": []map[string]string{
+			{"role": "system", "content": aiCommandSystemPrompt()},
+			{"role": "user", "content": fmt.Sprintf("User request: %s", request.Prompt)},
+		},
+		"temperature": 0.2,
+	}
+	responseBody, err := postJSON(request.Endpoint, request.APIKey, payload)
+	if err != nil {
+		return "", err
+	}
+	return extractChatCompletionText(responseBody)
+}
+
+func callGeminiCommands(request AICommandRequest) (string, error) {
+	endpoint := request.Endpoint
+	if endpoint == "" {
+		endpoint, _ = defaultAIProviderConfig("gemini")
+	}
+	endpoint = strings.ReplaceAll(endpoint, "{model}", request.Model)
+	if !strings.Contains(endpoint, "key=") {
+		separator := "?"
+		if strings.Contains(endpoint, "?") {
+			separator = "&"
+		}
+		endpoint += separator + "key=" + request.APIKey
+	}
+
+	payload := map[string]interface{}{
+		"systemInstruction": map[string]interface{}{
+			"parts": []map[string]string{{"text": aiCommandSystemPrompt()}},
+		},
+		"contents": []map[string]interface{}{
+			{
+				"role":  "user",
+				"parts": []map[string]string{{"text": fmt.Sprintf("User request: %s", request.Prompt)}},
+			},
+		},
+		"generationConfig": map[string]interface{}{"temperature": 0.2},
+	}
+	responseBody, err := postJSON(endpoint, "", payload)
+	if err != nil {
+		return "", err
+	}
+	return extractGeminiText(responseBody)
+}
+
+func postJSON(endpoint string, apiKey string, payload interface{}) ([]byte, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	httpRequest, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	if apiKey != "" {
+		httpRequest.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 45 * time.Second}
+	response, err := client.Do(httpRequest)
+	if err != nil {
+		return nil, fmt.Errorf("AI request failed: %w", err)
+	}
+	defer response.Body.Close()
+
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("AI request failed with status %d: %s", response.StatusCode, string(responseBody))
+	}
+	return responseBody, nil
+}
+
+func extractChatCompletionText(data []byte) (string, error) {
+	var raw struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return "", fmt.Errorf("could not parse AI response: %w", err)
+	}
+	if raw.Error != nil && raw.Error.Message != "" {
+		return "", errors.New(raw.Error.Message)
+	}
+	if len(raw.Choices) == 0 || strings.TrimSpace(raw.Choices[0].Message.Content) == "" {
+		return "", errors.New("AI response did not contain text")
+	}
+	return raw.Choices[0].Message.Content, nil
+}
+
+func extractGeminiText(data []byte) (string, error) {
+	var raw struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return "", fmt.Errorf("could not parse Gemini response: %w", err)
+	}
+	if raw.Error != nil && raw.Error.Message != "" {
+		return "", errors.New(raw.Error.Message)
+	}
+	var builder strings.Builder
+	for _, candidate := range raw.Candidates {
+		for _, part := range candidate.Content.Parts {
+			builder.WriteString(part.Text)
+		}
+	}
+	text := strings.TrimSpace(builder.String())
+	if text == "" {
+		return "", errors.New("Gemini response did not contain text")
+	}
+	return text, nil
+}
+
+func parseAICommandSuggestions(text string) ([]AICommandSuggestion, error) {
+	text = strings.TrimSpace(text)
+	start := strings.Index(text, "[")
+	end := strings.LastIndex(text, "]")
+	if start < 0 || end < start {
+		return nil, errors.New("AI response did not contain a JSON array")
+	}
+
+	var suggestions []AICommandSuggestion
+	if err := json.Unmarshal([]byte(text[start:end+1]), &suggestions); err != nil {
+		return nil, fmt.Errorf("could not parse AI command JSON: %w", err)
+	}
+
+	cleaned := make([]AICommandSuggestion, 0, len(suggestions))
+	for _, suggestion := range suggestions {
+		suggestion.Command = strings.TrimSpace(suggestion.Command)
+		suggestion.Description = strings.TrimSpace(suggestion.Description)
+		suggestion.Category = strings.TrimSpace(suggestion.Category)
+		if suggestion.Command == "" || suggestion.Description == "" {
+			continue
+		}
+		if suggestion.Category == "" {
+			suggestion.Category = "AI"
+		}
+		cleaned = append(cleaned, suggestion)
+		if len(cleaned) >= 5 {
+			break
+		}
+	}
+	return cleaned, nil
 }
 
 func buildAuthMethods(options ConnectionOptions) ([]ssh.AuthMethod, error) {

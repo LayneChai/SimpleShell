@@ -1,5 +1,41 @@
 export namespace main {
 	
+	export class AICommandRequest {
+	    provider: string;
+	    apiKey: string;
+	    endpoint: string;
+	    model: string;
+	    prompt: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new AICommandRequest(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.provider = source["provider"];
+	        this.apiKey = source["apiKey"];
+	        this.endpoint = source["endpoint"];
+	        this.model = source["model"];
+	        this.prompt = source["prompt"];
+	    }
+	}
+	export class AICommandSuggestion {
+	    command: string;
+	    description: string;
+	    category: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new AICommandSuggestion(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.command = source["command"];
+	        this.description = source["description"];
+	        this.category = source["category"];
+	    }
+	}
 	export class ConnectionOptions {
 	    sessionId: string;
 	    host: string;

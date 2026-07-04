@@ -18,6 +18,10 @@ export function DisconnectAll() {
   return window['go']['main']['App']['DisconnectAll']();
 }
 
+export function GenerateAICommands(arg1) {
+  return window['go']['main']['App']['GenerateAICommands'](arg1);
+}
+
 export function LoadSettings() {
   return window['go']['main']['App']['LoadSettings']();
 }

@@ -10,6 +10,8 @@ export function Disconnect(arg1:string):Promise<void>;
 
 export function DisconnectAll():Promise<void>;
 
+export function GenerateAICommands(arg1:main.AICommandRequest):Promise<Array<main.AICommandSuggestion>>;
+
 export function LoadSettings():Promise<main.TerminalSettings>;
 
 export function Resize(arg1:string,arg2:number,arg3:number):Promise<void>;

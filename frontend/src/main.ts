@@ -7,6 +7,7 @@ import {
 	ConfirmHostKey,
 	Connect,
 	Disconnect,
+	GenerateAICommands,
 	Resize,
 	SelectPrivateKey,
 	SendInput,
@@ -62,14 +63,54 @@ type CommandSuggestion = {
 	category: string;
 };
 
+type CommandRiskLevel = 'low' | 'medium' | 'high';
+
+type CommandRisk = {
+	level: CommandRiskLevel;
+	label: string;
+	reason: string;
+};
+
+type CommandAdvice = CommandSuggestion & {
+	risk: CommandRisk;
+};
+
+type IntentTemplate = {
+	keywords: string[];
+	commands: CommandSuggestion[];
+};
+
+type AISettings = {
+	provider: string;
+	apiKey: string;
+	endpoint: string;
+	model: string;
+};
+
+type AIProviderPreset = {
+	id: string;
+	label: string;
+	endpoint: string;
+	model: string;
+};
+
 const backendReady = Boolean((window as any).go?.main?.App && (window as any).runtime);
 const sessions = new Map<string, ShellSession>();
 const profiles: ConnectionProfile[] = [];
 const profileSessionIds = new Map<string, string>();
 const transparencyStorageKey = 'simpleshell.backgroundTransparency';
 const profilesStorageKey = 'simpleshell.connectionProfiles';
+const aiSettingsStorageKey = 'simpleshell.aiSettings';
 const defaultTransparency = 100;
-const commandSuggestionLimit = 6;
+const aiProviderPresets: AIProviderPreset[] = [
+	{id: 'local', label: '本地规则', endpoint: '', model: ''},
+	{id: 'chatgpt', label: 'ChatGPT', endpoint: 'https://api.openai.com/v1/chat/completions', model: 'gpt-4.1-mini'},
+	{id: 'deepseek', label: 'DeepSeek', endpoint: 'https://api.deepseek.com/chat/completions', model: 'deepseek-chat'},
+	{id: 'kimi', label: 'Kimi', endpoint: 'https://api.moonshot.cn/v1/chat/completions', model: 'moonshot-v1-8k'},
+	{id: 'glm', label: 'GLM', endpoint: 'https://open.bigmodel.cn/api/paas/v4/chat/completions', model: 'glm-4-flash'},
+	{id: 'gemini', label: 'Gemini', endpoint: 'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent', model: 'gemini-2.0-flash'},
+	{id: 'custom', label: '第三方平台', endpoint: '', model: ''},
+];
 const commandSuggestions: CommandSuggestion[] = [
 	{command: 'pwd', description: '显示当前所在目录', category: '目录'},
 	{command: 'ls -la', description: '查看当前目录下的全部文件', category: '目录'},
@@ -92,16 +133,75 @@ const commandSuggestions: CommandSuggestion[] = [
 	{command: 'scp file user@host:/path', description: '复制文件到远程服务器', category: '传输'},
 	{command: 'chmod +x script.sh', description: '给脚本添加执行权限', category: '权限'},
 ];
+const intentTemplates: IntentTemplate[] = [
+	{
+		keywords: ['日志', 'log', '报错', '错误', 'error'],
+		commands: [
+			{command: 'tail -n 100 /var/log/syslog', description: '查看最近 100 行系统日志', category: '日志'},
+			{command: 'journalctl -xe --no-pager', description: '查看 systemd 最近错误详情', category: '日志'},
+			{command: 'tail -f app.log', description: '实时跟踪应用日志', category: '日志'},
+		],
+	},
+	{
+		keywords: ['磁盘', '空间', '容量', '占用', 'disk'],
+		commands: [
+			{command: 'df -h', description: '查看各分区磁盘空间', category: '系统'},
+			{command: 'du -sh * | sort -h', description: '查看当前目录下各项目占用大小', category: '系统'},
+			{command: 'find /var/log -type f -size +100M', description: '查找较大的日志文件', category: '搜索'},
+		],
+	},
+	{
+		keywords: ['内存', 'memory', '负载', 'load', '性能'],
+		commands: [
+			{command: 'free -h', description: '查看内存使用情况', category: '系统'},
+			{command: 'top', description: '实时查看负载和进程', category: '系统'},
+			{command: 'uptime', description: '查看系统运行时间和平均负载', category: '系统'},
+		],
+	},
+	{
+		keywords: ['端口', 'port', '监听', 'listen'],
+		commands: [
+			{command: 'ss -tulpen', description: '查看监听端口和对应进程', category: '网络'},
+			{command: 'ss -tulpen | grep 80', description: '查找指定端口监听情况', category: '网络'},
+			{command: 'lsof -i :80', description: '查看占用指定端口的进程', category: '网络'},
+		],
+	},
+	{
+		keywords: ['服务', 'service', '状态', '启动', '重启', 'restart'],
+		commands: [
+			{command: 'systemctl status service', description: '查看服务状态', category: '服务'},
+			{command: 'journalctl -u service -n 100 --no-pager', description: '查看指定服务最近日志', category: '服务'},
+			{command: 'systemctl restart service', description: '重启指定服务', category: '服务'},
+		],
+	},
+	{
+		keywords: ['docker', '容器', 'container'],
+		commands: [
+			{command: 'docker ps', description: '查看正在运行的容器', category: '容器'},
+			{command: 'docker logs -n 100 container', description: '查看容器最近日志', category: '容器'},
+			{command: 'docker exec -it container sh', description: '进入容器 shell', category: '容器'},
+		],
+	},
+	{
+		keywords: ['nginx', '网站', 'web'],
+		commands: [
+			{command: 'systemctl status nginx', description: '查看 Nginx 服务状态', category: 'Web'},
+			{command: 'nginx -t', description: '检查 Nginx 配置语法', category: 'Web'},
+			{command: 'tail -n 100 /var/log/nginx/error.log', description: '查看 Nginx 最近错误日志', category: 'Web'},
+		],
+	},
+];
 let activeSessionId = '';
 let editingProfileId = '';
-let activeSuggestionIndex = 0;
 
 document.querySelector('#app')!.innerHTML = `
 	<div class="app-shell">
 		<header class="window-titlebar">
 			<div class="window-brand">
 				<span>SimpleShell</span>
-				<button id="settingsButton" type="button" class="title-button">透明度</button>
+				<nav class="menu-bar" aria-label="主菜单">
+					<button id="settingsButton" type="button" class="menu-button">设置</button>
+				</nav>
 			</div>
 			<div class="window-controls">
 				<button id="minimizeWindowButton" type="button" class="window-button" title="最小化">-</button>
@@ -109,11 +209,53 @@ document.querySelector('#app')!.innerHTML = `
 				<button id="closeWindowButton" type="button" class="window-button close" title="关闭">×</button>
 			</div>
 		</header>
-		<div id="settingsMenu" class="settings-menu hidden">
-			<label>
-				<span>背景透明度 <strong id="transparencyValue">100%</strong></span>
+		<div id="settingsMenu" class="settings-menu hidden" role="dialog" aria-labelledby="settingsTitle">
+			<header class="settings-header">
+				<strong id="settingsTitle">设置</strong>
+				<button id="closeSettingsButton" type="button" class="window-button" title="关闭">×</button>
+			</header>
+			<section class="settings-section" aria-label="透明度设置">
+				<div class="settings-section-title">
+					<strong>透明度</strong>
+					<span id="transparencyValue">100%</span>
+				</div>
 				<input id="transparencyRange" type="range" min="0" max="100" step="1" value="100" />
-			</label>
+			</section>
+			<section class="settings-section assistant-settings" aria-label="AI 大模型配置">
+				<div class="settings-section-title">
+					<strong>AI 大模型</strong>
+					<span id="assistantModeText">本地规则模式</span>
+				</div>
+				<label>
+					<span>模型服务</span>
+					<select id="aiProvider">
+						<option value="local">本地规则</option>
+						<option value="chatgpt">ChatGPT</option>
+						<option value="deepseek">DeepSeek</option>
+						<option value="kimi">Kimi</option>
+						<option value="glm">GLM</option>
+						<option value="gemini">Gemini</option>
+						<option value="custom">第三方平台</option>
+					</select>
+				</label>
+				<label id="aiApiKeyField">
+					<span>API Key</span>
+					<input id="aiApiKey" type="password" autocomplete="off" placeholder="选择模型服务后填入对应 API Key" />
+				</label>
+				<div id="aiCustomFields" class="assistant-settings-row hidden">
+					<label>
+						<span>模型</span>
+						<input id="aiModel" type="text" autocomplete="off" placeholder="如：gpt-5.5" />
+					</label>
+					<label>
+						<span>接口地址</span>
+						<input id="aiEndpoint" type="url" autocomplete="off" placeholder="输入完整URL如:域名/v1/chat/completions" />
+					</label>
+				</div>
+				<div class="settings-actions">
+					<button id="saveAISettingsButton" type="button" class="primary-button">保存配置</button>
+				</div>
+			</section>
 		</div>
 		<main class="shell-layout">
 		<aside class="sidebar" aria-label="连接控制">
@@ -142,17 +284,33 @@ document.querySelector('#app')!.innerHTML = `
 					<strong id="activeTitle">暂无连接</strong>
 					<span id="activeMeta">请在左侧创建 SSH 连接。</span>
 				</div>
-				<button id="clearTerminalButton" type="button" class="icon-button" title="清空终端" disabled>清空</button>
+				<div class="terminal-actions">
+					<button id="clearTerminalButton" type="button" class="icon-button" title="清空终端" disabled>清空</button>
+				</div>
 			</header>
 			<div id="terminalFrame" class="terminal-frame">
 				<div id="terminalEmpty" class="terminal-empty">打开一个 SSH 连接后开始终端会话。</div>
 				<div id="terminalStack" class="terminal-stack"></div>
 			</div>
 			<form id="commandForm" class="command-bar">
-				<input id="commandInput" type="text" autocomplete="off" placeholder="输入命令后按回车执行" aria-autocomplete="list" aria-controls="commandSuggestions" disabled />
+				<button id="assistantButton" type="button" class="ai-command-button" title="AI 命令助手" disabled>AI</button>
+				<input id="commandInput" type="text" autocomplete="off" placeholder="输入命令后按回车执行" disabled />
 				<button id="sendCommandButton" type="submit" class="primary-button" disabled>运行</button>
 			</form>
-			<div id="commandSuggestions" class="command-suggestions hidden" role="listbox" aria-label="命令提示"></div>
+			<div id="assistantPanel" class="assistant-panel hidden" role="dialog" aria-labelledby="assistantTitle">
+				<header class="assistant-header">
+					<div>
+						<strong id="assistantTitle">AI 命令助手</strong>
+						<span id="assistantPanelModeText">本地规则模式</span>
+					</div>
+					<button id="closeAssistantButton" type="button" class="window-button" title="关闭">×</button>
+				</header>
+				<form id="assistantForm" class="assistant-form">
+					<textarea id="assistantPrompt" rows="3" placeholder="例如：查看 nginx 最近错误日志"></textarea>
+					<button id="assistantGenerateButton" type="submit" class="primary-button">生成</button>
+				</form>
+				<div id="assistantResults" class="assistant-results"></div>
+			</div>
 			<div id="messageBar" class="message-bar" role="status" aria-live="polite"></div>
 		</section>
 		</main>
@@ -244,6 +402,7 @@ const connectButton = document.getElementById('connectButton') as HTMLButtonElem
 const passwordField = document.getElementById('passwordField') as HTMLElement;
 const keyFields = document.getElementById('keyFields') as HTMLElement;
 const browseKeyButton = document.getElementById('browseKey') as HTMLButtonElement;
+const closeSettingsButton = document.getElementById('closeSettingsButton') as HTMLButtonElement;
 const statusText = document.getElementById('statusText') as HTMLElement;
 const connectionList = document.getElementById('connectionList') as HTMLElement;
 const connectionCount = document.getElementById('connectionCount') as HTMLElement;
@@ -251,15 +410,30 @@ const terminalStack = document.getElementById('terminalStack') as HTMLElement;
 const terminalEmpty = document.getElementById('terminalEmpty') as HTMLElement;
 const activeTitle = document.getElementById('activeTitle') as HTMLElement;
 const activeMeta = document.getElementById('activeMeta') as HTMLElement;
+const assistantButton = document.getElementById('assistantButton') as HTMLButtonElement;
+const assistantPanel = document.getElementById('assistantPanel') as HTMLElement;
+const closeAssistantButton = document.getElementById('closeAssistantButton') as HTMLButtonElement;
+const assistantModeText = document.getElementById('assistantModeText') as HTMLElement;
+const assistantPanelModeText = document.getElementById('assistantPanelModeText') as HTMLElement;
+const aiProviderInput = document.getElementById('aiProvider') as HTMLSelectElement;
+const aiApiKeyField = document.getElementById('aiApiKeyField') as HTMLElement;
+const aiApiKeyInput = document.getElementById('aiApiKey') as HTMLInputElement;
+const aiCustomFields = document.getElementById('aiCustomFields') as HTMLElement;
+const aiModelInput = document.getElementById('aiModel') as HTMLInputElement;
+const aiEndpointInput = document.getElementById('aiEndpoint') as HTMLInputElement;
+const saveAISettingsButton = document.getElementById('saveAISettingsButton') as HTMLButtonElement;
+const assistantForm = document.getElementById('assistantForm') as HTMLFormElement;
+const assistantPrompt = document.getElementById('assistantPrompt') as HTMLTextAreaElement;
+const assistantResults = document.getElementById('assistantResults') as HTMLElement;
 const clearTerminalButton = document.getElementById('clearTerminalButton') as HTMLButtonElement;
 const commandForm = document.getElementById('commandForm') as HTMLFormElement;
 const commandInput = document.getElementById('commandInput') as HTMLInputElement;
 const sendCommandButton = document.getElementById('sendCommandButton') as HTMLButtonElement;
-const commandSuggestionsElement = document.getElementById('commandSuggestions') as HTMLElement;
 const messageBar = document.getElementById('messageBar') as HTMLElement;
 
 loadTransparency();
 loadProfiles();
+loadAISettings();
 bindEvents();
 renderConnections();
 
@@ -270,6 +444,7 @@ function bindEvents() {
 	});
 
 	settingsMenu.addEventListener('click', (event) => event.stopPropagation());
+	closeSettingsButton.addEventListener('click', closeSettingsMenu);
 
 	transparencyRange.addEventListener('input', () => {
 		const value = clampTransparency(Number(transparencyRange.value));
@@ -297,10 +472,11 @@ function bindEvents() {
 		}
 	});
 
-	document.addEventListener('click', () => settingsMenu.classList.add('hidden'));
+	document.addEventListener('click', closeSettingsMenu);
 	document.addEventListener('keydown', (event) => {
 		if (event.key === 'Escape') {
-			settingsMenu.classList.add('hidden');
+			closeSettingsMenu();
+			closeAssistantPanel();
 			closeConnectionModal();
 		}
 	});
@@ -321,50 +497,34 @@ function bindEvents() {
 	clearTerminalButton.addEventListener('click', () => {
 		activeSession()?.terminal.clear();
 	});
+	assistantButton.addEventListener('click', () => {
+		assistantPanel.classList.toggle('hidden');
+		if (!assistantPanel.classList.contains('hidden')) {
+			clearAssistantInput();
+			window.setTimeout(() => assistantPrompt.focus(), 20);
+		}
+	});
+	closeAssistantButton.addEventListener('click', closeAssistantPanel);
+	[aiProviderInput, aiApiKeyInput, aiModelInput, aiEndpointInput].forEach((input) => {
+		input.addEventListener('input', syncAISettingsPreview);
+		input.addEventListener('change', syncAISettingsPreview);
+	});
+	saveAISettingsButton.addEventListener('click', saveAISettings);
+	assistantForm.addEventListener('submit', (event) => {
+		event.preventDefault();
+		void renderAssistantResults();
+	});
 
 	commandForm.addEventListener('submit', (event) => {
 		event.preventDefault();
 		void sendCommandLine();
 	});
-	commandInput.addEventListener('input', () => {
-		activeSuggestionIndex = 0;
-		renderCommandSuggestions();
-	});
-	commandInput.addEventListener('focus', renderCommandSuggestions);
-	commandInput.addEventListener('blur', () => {
-		window.setTimeout(hideCommandSuggestions, 120);
-	});
 	commandInput.addEventListener('keydown', (event) => {
-		const suggestions = matchingCommandSuggestions();
-		const hasVisibleSuggestions = commandSuggestionsElement.dataset.visible === 'true' && suggestions.length > 0;
-
-		if (hasVisibleSuggestions && event.key === 'ArrowDown') {
-			event.preventDefault();
-			activeSuggestionIndex = (activeSuggestionIndex + 1) % suggestions.length;
-			renderCommandSuggestions();
-			return;
-		}
-		if (hasVisibleSuggestions && event.key === 'ArrowUp') {
-			event.preventDefault();
-			activeSuggestionIndex = (activeSuggestionIndex - 1 + suggestions.length) % suggestions.length;
-			renderCommandSuggestions();
-			return;
-		}
-		if (hasVisibleSuggestions && event.key === 'Tab') {
-			event.preventDefault();
-			applyCommandSuggestion(suggestions[activeSuggestionIndex]);
-			return;
-		}
 		if (event.key === 'Escape') {
-			hideCommandSuggestions();
+			closeAssistantPanel();
 			return;
 		}
 		if (event.key !== 'Enter') {
-			return;
-		}
-		if (hasVisibleSuggestions) {
-			event.preventDefault();
-			applyCommandSuggestion(suggestions[activeSuggestionIndex]);
 			return;
 		}
 		event.preventDefault();
@@ -452,6 +612,102 @@ function loadProfiles() {
 
 function saveProfiles() {
 	localStorage.setItem(profilesStorageKey, JSON.stringify(profiles));
+}
+
+function loadAISettings() {
+	const settings = readStoredAISettings();
+	aiProviderInput.value = settings.provider;
+	aiApiKeyInput.value = settings.apiKey;
+	aiModelInput.value = settings.model;
+	aiEndpointInput.value = settings.endpoint;
+	syncAIProviderFields(settings);
+	syncAssistantModeText(settings);
+}
+
+function readStoredAISettings(): AISettings {
+	try {
+		const raw = localStorage.getItem(aiSettingsStorageKey);
+		if (!raw) {
+			return defaultAISettings();
+		}
+		const parsed = JSON.parse(raw) as Partial<AISettings>;
+		const legacyUseRemote = Boolean((parsed as Partial<AISettings> & {useRemote?: boolean}).useRemote);
+		return normalizeAISettings({
+			provider: String(parsed.provider || (legacyUseRemote ? 'chatgpt' : 'local')),
+			apiKey: String(parsed.apiKey || ''),
+			endpoint: String(parsed.endpoint || ''),
+			model: String(parsed.model || ''),
+		});
+	} catch {
+		return defaultAISettings();
+	}
+}
+
+function readAISettingsFromForm(): AISettings {
+	return normalizeAISettings({
+		provider: aiProviderInput.value,
+		apiKey: aiApiKeyInput.value,
+		endpoint: aiEndpointInput.value,
+		model: aiModelInput.value,
+	});
+}
+
+function saveAISettings() {
+	const settings = readAISettingsFromForm();
+	localStorage.setItem(aiSettingsStorageKey, JSON.stringify(settings));
+	syncAIProviderFields(settings);
+	syncAssistantModeText(settings);
+	messageBar.textContent = 'AI 大模型配置已保存。';
+}
+
+function syncAISettingsPreview() {
+	const settings = readAISettingsFromForm();
+	syncAIProviderFields(settings);
+	syncAssistantModeText(settings);
+}
+
+function defaultAISettings(): AISettings {
+	return {
+		provider: 'local',
+		apiKey: '',
+		endpoint: '',
+		model: '',
+	};
+}
+
+function normalizeAISettings(settings: AISettings): AISettings {
+	const preset = providerPreset(settings.provider) || providerPreset('local')!;
+	const isCustom = preset.id === 'custom';
+	return {
+		provider: preset.id,
+		apiKey: settings.apiKey.trim(),
+		endpoint: isCustom ? settings.endpoint.trim() : preset.endpoint,
+		model: isCustom ? settings.model.trim() : preset.model,
+	};
+}
+
+function syncAssistantModeText(settings = readAISettingsFromForm()) {
+	const preset = providerPreset(settings.provider);
+	const text = settings.provider === 'local' ? '本地规则模式' : `${preset?.label || '第三方平台'}：${settings.model}`;
+	assistantModeText.textContent = text;
+	assistantPanelModeText.textContent = text;
+}
+
+function syncAIProviderFields(settings = readAISettingsFromForm()) {
+	const usesRemote = settings.provider !== 'local';
+	const isCustom = settings.provider === 'custom';
+	aiApiKeyField.classList.toggle('hidden', !usesRemote);
+	aiCustomFields.classList.toggle('hidden', !isCustom);
+	aiModelInput.value = settings.model;
+	aiEndpointInput.value = settings.endpoint;
+}
+
+function providerPreset(provider: string) {
+	return aiProviderPresets.find((preset) => preset.id === provider);
+}
+
+function closeSettingsMenu() {
+	settingsMenu.classList.add('hidden');
 }
 
 function openConnectionModal(profileId = '') {
@@ -609,8 +865,11 @@ async function sendCommandLine() {
 	if (!shell || !command.trim()) {
 		return;
 	}
+	const risk = assessCommandRisk(command);
+	if (risk.level === 'high' && !confirmHighRiskCommand(command, risk)) {
+		return;
+	}
 	commandInput.value = '';
-	hideCommandSuggestions();
 
 	if (backendReady && shell.status === 'Connected') {
 		await SendInput(shell.id, `${command}\r`).catch((error) => showError(error, shell.id));
@@ -619,94 +878,149 @@ async function sendCommandLine() {
 	}
 }
 
-function matchingCommandSuggestions() {
-	if (commandInput.disabled) {
-		return [];
-	}
-
-	const query = commandInput.value.trim().toLowerCase();
-	if (!query) {
-		return commandSuggestions.slice(0, commandSuggestionLimit);
-	}
-
-	return commandSuggestions
-		.filter((suggestion) => {
-			const searchable = `${suggestion.command} ${suggestion.description} ${suggestion.category}`.toLowerCase();
-			return searchable.includes(query);
-		})
-		.slice(0, commandSuggestionLimit);
+function closeAssistantPanel() {
+	assistantPanel.classList.add('hidden');
+	clearAssistantInput();
 }
 
-function renderCommandSuggestions() {
-	const suggestions = matchingCommandSuggestions();
-	if (suggestions.length === 0 || document.activeElement !== commandInput) {
-		hideCommandSuggestions();
+function clearAssistantInput() {
+	assistantPrompt.value = '';
+	assistantResults.innerHTML = '';
+}
+
+async function renderAssistantResults() {
+	const settings = readAISettingsFromForm();
+	let advices = generateCommandAdvices(assistantPrompt.value);
+	if (settings.provider !== 'local') {
+		if (!settings.apiKey) {
+			assistantResults.innerHTML = '<div class="assistant-empty">请选择模型服务后填写对应 API Key。</div>';
+			return;
+		}
+		assistantResults.innerHTML = '<div class="assistant-empty">正在请求大模型...</div>';
+		try {
+			const remoteSuggestions = await GenerateAICommands({
+				provider: settings.provider,
+				apiKey: settings.apiKey,
+				endpoint: settings.endpoint,
+				model: settings.model,
+				prompt: assistantPrompt.value,
+			});
+			advices = remoteSuggestions.map((suggestion) => ({
+				command: suggestion.command,
+				description: suggestion.description,
+				category: suggestion.category || 'AI',
+				risk: assessCommandRisk(suggestion.command),
+			}));
+		} catch (error) {
+			messageBar.textContent = `AI 请求失败，已使用本地兜底：${localizedError(error instanceof Error ? error.message : String(error))}`;
+		}
+	}
+	if (advices.length === 0) {
+		assistantResults.innerHTML = '<div class="assistant-empty">没有匹配到合适命令，可以换成“查看日志”“查端口”“看磁盘空间”这类描述。</div>';
 		return;
 	}
 
-	activeSuggestionIndex = Math.min(activeSuggestionIndex, suggestions.length - 1);
-	commandSuggestionsElement.dataset.visible = 'true';
-	commandSuggestionsElement.classList.remove('hidden');
-	commandSuggestionsElement.innerHTML = suggestions.map((suggestion, index) => `
-		<button
-			type="button"
-			class="command-suggestion ${index === activeSuggestionIndex ? 'active' : ''}"
-			data-index="${index}"
-			role="option"
-			aria-selected="${index === activeSuggestionIndex}"
-		>
-			<span class="command-suggestion-main">${highlightCommandMatch(suggestion.command)}</span>
-			<span class="command-suggestion-meta">
-				<strong>${escapeHtml(suggestion.category)}</strong>
-				${escapeHtml(suggestion.description)}
-			</span>
-		</button>
+	assistantResults.innerHTML = advices.map((advice, index) => `
+		<article class="assistant-result" data-risk="${advice.risk.level}">
+			<div class="assistant-result-head">
+				<code>${escapeHtml(advice.command)}</code>
+				<span class="risk-badge" data-risk="${advice.risk.level}">${advice.risk.label}</span>
+			</div>
+			<p>${escapeHtml(explainCommand(advice))}</p>
+			<small>${escapeHtml(advice.risk.reason)}</small>
+			<button type="button" class="secondary-button" data-action="fill-command" data-index="${index}">填入命令</button>
+		</article>
 	`).join('');
 
-	commandSuggestionsElement.querySelectorAll<HTMLButtonElement>('.command-suggestion').forEach((button) => {
-		button.addEventListener('mouseenter', () => {
-			activeSuggestionIndex = Number(button.dataset.index || '0');
-			renderCommandSuggestions();
-		});
-		button.addEventListener('mousedown', (event) => {
-			event.preventDefault();
-			applyCommandSuggestion(suggestions[Number(button.dataset.index || '0')]);
+	assistantResults.querySelectorAll<HTMLButtonElement>('[data-action="fill-command"]').forEach((button) => {
+		button.addEventListener('click', () => {
+			const advice = advices[Number(button.dataset.index || '0')];
+			if (!advice) {
+				return;
+			}
+			commandInput.value = advice.command;
+			closeAssistantPanel();
+			commandInput.focus();
+			commandInput.setSelectionRange(commandInput.value.length, commandInput.value.length);
+			messageBar.textContent = `${advice.risk.label}：${advice.risk.reason}`;
 		});
 	});
 }
 
-function hideCommandSuggestions() {
-	commandSuggestionsElement.dataset.visible = 'false';
-	commandSuggestionsElement.classList.add('hidden');
-	commandSuggestionsElement.innerHTML = '';
+function generateCommandAdvices(prompt: string): CommandAdvice[] {
+	const query = prompt.trim().toLowerCase();
+	const source = query ? prompt : '常用命令';
+	const matches = intentTemplates
+		.filter((template) => template.keywords.some((keyword) => source.toLowerCase().includes(keyword.toLowerCase())))
+		.flatMap((template) => template.commands);
+	const fallback = query
+		? commandSuggestions.filter((suggestion) => {
+			const searchable = `${suggestion.command} ${suggestion.description} ${suggestion.category}`.toLowerCase();
+			return searchable.includes(query);
+		})
+		: commandSuggestions.slice(0, 4);
+	const seen = new Set<string>();
+	return [...matches, ...fallback]
+		.filter((suggestion) => {
+			if (seen.has(suggestion.command)) {
+				return false;
+			}
+			seen.add(suggestion.command);
+			return true;
+		})
+		.slice(0, 5)
+		.map((suggestion) => ({...suggestion, risk: assessCommandRisk(suggestion.command)}));
 }
 
-function applyCommandSuggestion(suggestion: CommandSuggestion | undefined) {
-	if (!suggestion) {
-		return;
+function explainCommand(suggestion: CommandSuggestion) {
+	const base = suggestion.description;
+	const command = suggestion.command.toLowerCase();
+	if (command.startsWith('systemctl restart')) {
+		return `${base}。执行后服务会短暂中断，建议先查看 status 和日志。`;
 	}
-
-	commandInput.value = suggestion.command;
-	hideCommandSuggestions();
-	commandInput.focus();
-	commandInput.setSelectionRange(commandInput.value.length, commandInput.value.length);
+	if (command.startsWith('chmod')) {
+		return `${base}。执行前确认路径和权限范围。`;
+	}
+	if (command.includes('tail -f')) {
+		return `${base}。按 Ctrl+C 可以退出实时查看。`;
+	}
+	return `${base}。`;
 }
 
-function highlightCommandMatch(command: string) {
-	const query = commandInput.value.trim();
-	if (!query) {
-		return escapeHtml(command);
+function assessCommandRisk(command: string): CommandRisk {
+	const normalized = command.trim().toLowerCase();
+	const highRiskPatterns = [
+		/\brm\s+(-[a-z]*r[a-z]*f|-rf|-fr)\b/,
+		/\bmkfs\b/,
+		/\bdd\s+if=/,
+		/\bshutdown\b/,
+		/\breboot\b/,
+		/\binit\s+0\b/,
+		/\biptables\s+-f\b/,
+		/\bufw\s+disable\b/,
+		/>\s*\/dev\/sd[a-z]/,
+	];
+	if (highRiskPatterns.some((pattern) => pattern.test(normalized))) {
+		return {level: 'high', label: '高风险', reason: '可能删除数据、重启系统、格式化磁盘或修改防火墙。'};
 	}
 
-	const index = command.toLowerCase().indexOf(query.toLowerCase());
-	if (index < 0) {
-		return escapeHtml(command);
+	const mediumRiskPatterns = [
+		/\bsystemctl\s+(restart|stop|disable)\b/,
+		/\bchmod\s+777\b/,
+		/\bchown\b/,
+		/\bkill\s+(-9\s+)?\d+/,
+		/\bdocker\s+(rm|restart|stop)\b/,
+		/\bmv\b.*\s+\//,
+	];
+	if (mediumRiskPatterns.some((pattern) => pattern.test(normalized))) {
+		return {level: 'medium', label: '中风险', reason: '会改变服务状态、权限、进程或文件位置，执行前请确认目标。'};
 	}
 
-	const before = command.slice(0, index);
-	const match = command.slice(index, index + query.length);
-	const after = command.slice(index + query.length);
-	return `${escapeHtml(before)}<mark>${escapeHtml(match)}</mark>${escapeHtml(after)}`;
+	return {level: 'low', label: '低风险', reason: '主要用于查看信息，通常不会修改系统。'};
+}
+
+function confirmHighRiskCommand(command: string, risk: CommandRisk) {
+	return window.confirm(`即将执行高风险命令：\n\n${command}\n\n${risk.reason}\n\n确认继续执行吗？`);
 }
 
 async function confirmHostKey(prompt: HostKeyPrompt) {
@@ -926,11 +1240,12 @@ function updateActiveChrome() {
 	activeTitle.textContent = shell ? shortLabel(shell.label) : '暂无连接';
 	activeTitle.title = shell?.label || '';
 	activeMeta.textContent = shell ? localizedStatus(shell.status) : '请在左侧创建 SSH 连接。';
+	assistantButton.disabled = !hasActive;
 	clearTerminalButton.disabled = !hasActive;
 	commandInput.disabled = !hasActive;
 	sendCommandButton.disabled = !hasActive;
 	if (!hasActive) {
-		hideCommandSuggestions();
+		closeAssistantPanel();
 	}
 	if (shell) {
 		statusText.textContent = `${shortLabel(shell.label)} · ${localizedStatus(shell.status)}`;
